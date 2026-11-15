@@ -636,7 +636,7 @@ class App(ctk.CTk):
                 self.msgs.put(("progress", n, total, iid, pct, text, title))
 
             try:
-                core.download_one(item.url, kind, quality, dest, prog, self.cancel)
+                core.download_one(item.url, kind, quality, dest, prog, self.cancel, item.index)
                 ok += 1
                 self.msgs.put(("row", iid, "✔ Concluído", "done"))
             except Exception as exc:  # noqa: BLE001

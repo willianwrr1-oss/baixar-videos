@@ -73,6 +73,7 @@ class VideoItem:
     duration: Optional[int] = None
     channel: str = ""
     thumbnail: str = ""
+    index: Optional[int] = None  # posição dentro da página/playlist (quando o item não tem link próprio)
 
 
 class _QuietLogger:
@@ -189,36 +190,75 @@ def fetch_thumbnail(url: str, size: tuple):
         return None
 
 
-def _collect(info: Optional[dict], out: list, seen: set) -> None:
-    if not info or len(out) >= MAX_ENTRIES:
-        return
-    entries = info.get("entries")
-    if entries is not None:
-        for entry in entries:
-            _collect(entry, out, seen)
-            if len(out) >= MAX_ENTRIES:
-                break
-        return
-    if str(info.get("ie_key", "")).endswith("Tab"):  # link para outra playlist/aba
-        return
-    url = info.get("webpage_url") or info.get("url")
+def _is_inline(entry: dict) -> bool:
+    """Entrada montada pelo próprio extrator (ex.: álbum com vários vídeos na mesma página).
+
+    Itens "soltos" de playlists do YouTube e embeds genéricos trazem `ie_key`/`_type: url`
+    e têm link próprio; os inline só existem dentro da página que os contém.
+    """
+    return not entry.get("ie_key") and entry.get("_type") not in ("url", "url_transparent")
+
+
+def _add_item(info: dict, out: list, seen: set, url: Optional[str] = None, index: Optional[int] = None,
+              page: str = "") -> None:
+    url = url or info.get("webpage_url") or info.get("url")
     if not url or not str(url).lower().startswith("http"):
         return
     vid = info.get("id")
-    key = f"{info.get('ie_key') or info.get('extractor_key') or ''}:{vid}" if vid else str(url)
-    if key in seen or str(url) in seen:
+    if index is not None:
+        key = f"{url}#{index}"
+    else:
+        key = f"{info.get('ie_key') or info.get('extractor_key') or ''}:{vid}" if vid else str(url)
+    if key in seen or (index is None and str(url) in seen):
         return
-    seen.update((key, str(url)))
+    seen.add(key)
+    if index is None:
+        seen.add(str(url))
+    title = str(info.get("title") or url)
+    if index is not None:
+        # itens da mesma página costumam ter o mesmo título: numera para diferenciar
+        if any(it.title == title for it in out if it.index is not None):
+            title = f"{title} ({index})"
     duration = info.get("duration")
     out.append(
         VideoItem(
             url=str(url),
-            title=str(info.get("title") or url),
+            title=title,
             duration=int(duration) if duration else None,
             channel=str(info.get("channel") or info.get("uploader") or ""),
             thumbnail=_pick_thumbnail(info),
+            index=index,
         )
     )
+
+
+def _collect(info: Optional[dict], out: list, seen: set, pages: set, top: bool = True) -> None:
+    if not info or len(out) >= MAX_ENTRIES:
+        return
+    entries = info.get("entries")
+    if entries is None:
+        _add_item(info, out, seen)
+        return
+    page = str(info.get("webpage_url") or info.get("original_url") or next(iter(pages), ""))
+    if page:
+        pages.add(page)
+    for pos, entry in enumerate(entries, 1):
+        if len(out) >= MAX_ENTRIES:
+            break
+        if not entry:
+            continue
+        if entry.get("entries") is not None:  # playlist dentro de playlist
+            _collect(entry, out, seen, pages, top=False)
+            continue
+        if str(entry.get("ie_key", "")).endswith("Tab"):  # link para outra playlist/aba
+            continue
+        own = entry.get("webpage_url") or entry.get("url")
+        # Sem link próprio (ou link igual ao da página): o item só existe dentro da página.
+        # Baixamos pela posição, senão o yt-dlp baixaria a página inteira a cada item.
+        if top and page and (_is_inline(entry) or str(own) in pages):
+            _add_item(entry, out, seen, url=page, index=pos)
+        else:
+            _add_item(entry, out, seen)
 
 
 def analyze(url: str) -> tuple[str, list[VideoItem], bool]:
@@ -234,7 +274,7 @@ def analyze(url: str) -> tuple[str, list[VideoItem], bool]:
         info = ydl.extract_info(url, download=False)
         if not info:
             raise RuntimeError("Nenhuma informação retornada para esse link.")
-        _collect(info, items, set())
+        _collect(info, items, set(), {url})
     title = str(info.get("title") or "") if info.get("entries") is not None else ""
     return title, items, len(items) >= MAX_ENTRIES
 
@@ -249,6 +289,7 @@ def download_one(
     dest: Path,
     on_progress: Callable[[float, str], None],
     cancel: threading.Event,
+    index: Optional[int] = None,
 ) -> str:
     """Baixa um item. Lança DownloadCancelled se `cancel` for acionado."""
     # O yt-dlp baixa vídeo e áudio em arquivos separados e depois junta. Sem tratar
@@ -302,12 +343,16 @@ def download_one(
         **_base_opts(),
         "outtmpl": str(Path(dest) / "%(title).150B.%(ext)s"),
         "windowsfilenames": True,
-        "noplaylist": True,
+        "noplaylist": index is None,
         "concurrent_fragment_downloads": 4,
         "fragment_retries": 5,
         "progress_hooks": [hook],
         "postprocessor_hooks": [pp_hook],
     }
+
+    if index is not None:  # item de uma página com vários vídeos: baixa só a posição escolhida
+        opts["playlist_items"] = str(index)
+        opts["outtmpl"] = str(Path(dest) / "%(title).130B (%(playlist_index)s).%(ext)s")
 
     if kind == KIND_AUDIO:
         opts["format"] = "bestaudio/best"
