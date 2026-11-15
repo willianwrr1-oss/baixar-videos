@@ -160,9 +160,13 @@ def _collect(info: Optional[dict], out: list, seen: set) -> None:
     if str(info.get("ie_key", "")).endswith("Tab"):  # link para outra playlist/aba
         return
     url = info.get("webpage_url") or info.get("url")
-    if not url or not str(url).lower().startswith("http") or url in seen:
+    if not url or not str(url).lower().startswith("http"):
         return
-    seen.add(url)
+    vid = info.get("id")
+    key = f"{info.get('ie_key') or info.get('extractor_key') or ''}:{vid}" if vid else str(url)
+    if key in seen or str(url) in seen:
+        return
+    seen.update((key, str(url)))
     duration = info.get("duration")
     out.append(
         VideoItem(
@@ -204,13 +208,27 @@ def download_one(
     cancel: threading.Event,
 ) -> str:
     """Baixa um item. Lança DownloadCancelled se `cancel` for acionado."""
-    state = {"stage": 0, "last": 0.0}
+    # O yt-dlp baixa vídeo e áudio em arquivos separados e depois junta. Sem tratar
+    # isso, a barra chegava a 100% duas vezes e parecia que o vídeo baixava em dobro.
+    state = {"files": [], "streams": 1, "last": 0.0}
 
     def hook(d: dict) -> None:
         if cancel.is_set():
             raise DownloadCancelled("Cancelado")
+        fname = d.get("tmpfilename") or d.get("filename") or ""
+        if fname and fname not in state["files"]:
+            state["files"].append(fname)
+            if len(state["files"]) == 1:
+                info = d.get("info_dict") or {}
+                video_only = (
+                    kind == KIND_VIDEO
+                    and info.get("vcodec") not in (None, "none")
+                    and info.get("acodec") == "none"
+                )
+                state["streams"] = 2 if video_only else 1
+        streams = state["streams"]
+        stage = min(max(len(state["files"]) - 1, 0), streams - 1)
         status = d.get("status")
-        streams = max(1, len((d.get("info_dict") or {}).get("requested_formats") or [1]))
         if status == "downloading":
             now = time.monotonic()
             if now - state["last"] < 0.15:
@@ -223,17 +241,15 @@ def download_one(
                 frac = (d.get("fragment_index") or 0) / d["fragment_count"]
             else:
                 frac = 0.0
-            overall = min(99.0, (state["stage"] + min(frac, 1.0)) / streams * 100)
+            overall = min(99.0, (stage + min(frac, 1.0)) / streams * 100)
             parts = [f"{overall:.0f}%"]
             if d.get("speed"):
                 parts.append(f"{_fmt_bytes(d['speed'])}/s")
             if d.get("eta") is not None:
                 parts.append(f"faltam {format_duration(d['eta'])}")
             on_progress(overall, " · ".join(parts))
-        elif status == "finished":
-            state["stage"] += 1
-            if state["stage"] >= streams:
-                on_progress(99.0, "Processando…")
+        elif status == "finished" and stage + 1 >= streams:
+            on_progress(99.0, "Processando…")
 
     def pp_hook(d: dict) -> None:
         if d.get("status") == "started":

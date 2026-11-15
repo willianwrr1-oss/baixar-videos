@@ -22,32 +22,50 @@ if os.name == "nt":
 
     subprocess.Popen.__init__ = _popen_init
 
+import ctypes
 import json
 import queue
 import re
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import quote
 
 import customtkinter as ctk
 
 import core
+import notify
 
 APP_NAME = "Baixador de Vídeos"
+APP_VERSION = "1.0.0"
+APP_UPDATED = "15/11/2026"
+APP_COMPAT = "Windows 10 ou superior"
+APP_AUTHOR = "Willian R Rocha"
+APP_EMAIL = "willian.wrr1@gmail.com"
+APP_DESC = (
+    "Baixe vídeos e músicas a partir de um link: o app lista os vídeos encontrados, "
+    "você escolhe quais quer e o formato (MP4 ou MP3). Funciona sem instalação."
+)
+APP_PRIVACY = (
+    "O aplicativo não coleta nem envia dados pessoais. A internet é usada apenas para "
+    "listar e baixar os vídeos dos links que você informar. Suas preferências ficam "
+    "somente neste computador."
+)
 
-# Paleta
-BG = "#12141A"
-CARD = "#1A1D25"
-CARD2 = "#222632"
-BORDER = "#2D3340"
-FG = "#E8EAF0"
-MUTED = "#8B93A5"
-ACCENT = "#4F8CFF"
-ACCENT_H = "#3A76E6"
-OK = "#3DD68C"
-ERR = "#FF6B6B"
-ROW_ALT = "#1E222C"
+THEMES = {
+    "dark": {
+        "bg": "#12141A", "card": "#1A1D25", "card2": "#222632", "border": "#2D3340",
+        "fg": "#E8EAF0", "muted": "#8B93A5", "accent": "#4F8CFF", "accent_h": "#3A76E6",
+        "ok": "#3DD68C", "err": "#FF6B6B", "row_alt": "#1E222C",
+    },
+    "light": {
+        "bg": "#F2F4F8", "card": "#FFFFFF", "card2": "#EEF1F6", "border": "#D5DAE3",
+        "fg": "#1B1F2A", "muted": "#667085", "accent": "#2F6FED", "accent_h": "#2459C4",
+        "ok": "#1E9E60", "err": "#D64545", "row_alt": "#F6F8FB",
+    },
+}
 
 CHECK_ON, CHECK_OFF = "☑", "☐"
 LABEL_VIDEO, LABEL_AUDIO = "Vídeo (MP4)", "Música (MP3)"
@@ -77,12 +95,18 @@ def default_dest() -> Path:
 
 class App(ctk.CTk):
     def __init__(self) -> None:
-        super().__init__(fg_color=BG)
-        self.title(APP_NAME)
-        self.geometry("1040x740")
-        self.minsize(900, 640)
-
         self.cfg = load_config()
+        self.theme = self.cfg.get("theme", "dark")
+        if self.theme not in THEMES:
+            self.theme = "dark"
+        self.P = THEMES[self.theme]
+        ctk.set_appearance_mode(self.theme)
+        super().__init__(fg_color=self.P["bg"])
+        self.title(APP_NAME)
+        self.geometry("1040x760")
+        self.minsize(900, 660)
+
+        self._themed: list[tuple] = []  # (widget, {opção: chave_da_paleta})
         self.msgs: queue.Queue = queue.Queue()
         self.cancel = threading.Event()
         self.items: dict[str, core.VideoItem] = {}
@@ -94,24 +118,75 @@ class App(ctk.CTk):
             self.kind_label = LABEL_VIDEO
 
         self._build_ui()
+        self._apply_theme()
         self._apply_kind(self.kind_label, restore=self.cfg.get("quality"))
-        self._set_icon()
+        self._set_icon(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll)
         self.entry.focus_set()
 
-    # ------------------------------------------------------------------ UI --
-    def _set_icon(self) -> None:
+    # ------------------------------------------------------------- Tema ----
+    def T(self, widget, **opts):
+        """Registra o widget para ser repintado quando o tema mudar e aplica as cores atuais."""
+        self._themed.append((widget, opts))
+        widget.configure(**{k: self.P.get(v, v) for k, v in opts.items()})
+        return widget
+
+    def _apply_theme(self) -> None:
+        P = self.P
+        ctk.set_appearance_mode(self.theme)
+        self.configure(fg_color=P["bg"])
+        for widget, opts in self._themed:
+            try:
+                widget.configure(**{k: P.get(v, v) for k, v in opts.items()})
+            except Exception:
+                pass
+        self._style_tree()
+        self.btn_theme.configure(text="Tema claro" if self.theme == "dark" else "Tema escuro")
+
+    def on_toggle_theme(self) -> None:
+        self.theme = "light" if self.theme == "dark" else "dark"
+        self.P = THEMES[self.theme]
+        self._apply_theme()
+
+    def _style_tree(self) -> None:
+        P = self.P
+        s = self._scale()
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.layout("Vid.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        style.configure(
+            "Vid.Treeview", background=P["card2"], fieldbackground=P["card2"], foreground=P["fg"],
+            borderwidth=0, rowheight=int(36 * s), font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Vid.Treeview.Heading", background=P["card"], foreground=P["muted"], relief="flat",
+            borderwidth=0, padding=(8, 8), font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "Vid.Treeview.Heading",
+            background=[("active", P["card"])], foreground=[("active", P["fg"])],
+        )
+        if hasattr(self, "tree"):
+            self.tree.tag_configure("even", background=P["card2"])
+            self.tree.tag_configure("odd", background=P["row_alt"])
+            self.tree.tag_configure("done", foreground=P["ok"])
+            self.tree.tag_configure("error", foreground=P["err"])
+            self.tree.tag_configure("active", foreground=P["accent"])
+
+    # ------------------------------------------------------------ Ícone ----
+    def _set_icon(self, window) -> None:
         path = core.bundle_dir() / "assets" / "icon.ico"
         if not path.exists():
             path = core.bundle_dir().parent / "assets" / "icon.ico"
         if path.exists() and os.name == "nt":
             # o customtkinter redefine o ícone ~200 ms após abrir; reaplicamos depois
-            self.after(300, lambda: self._try_icon(str(path)))
+            window.after(300, lambda: self._try_icon(window, str(path)))
 
-    def _try_icon(self, path: str) -> None:
+    @staticmethod
+    def _try_icon(window, path: str) -> None:
         try:
-            self.iconbitmap(path)
+            window.iconbitmap(path)
         except Exception:
             pass
 
@@ -121,10 +196,12 @@ class App(ctk.CTk):
         except Exception:
             return 1.0
 
-    def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
-        return ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
+    def _font(self, size: int, weight: str = "normal", underline: bool = False) -> ctk.CTkFont:
+        return ctk.CTkFont(family="Segoe UI", size=size, weight=weight, underline=underline)
 
+    # ------------------------------------------------------------- UI -------
     def _build_ui(self) -> None:
+        T = self.T
         pad = 24
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -132,72 +209,100 @@ class App(ctk.CTk):
         # Cabeçalho
         head = ctk.CTkFrame(self, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=pad, pady=(20, 10))
-        ctk.CTkLabel(head, text=APP_NAME, font=self._font(26, "bold"), text_color=FG).pack(anchor="w")
-        ctk.CTkLabel(
-            head,
-            text="Cole um link, escolha os vídeos e baixe em MP4 ou MP3.",
-            font=self._font(13),
-            text_color=MUTED,
+        head.grid_columnconfigure(0, weight=1)
+        titles = ctk.CTkFrame(head, fg_color="transparent")
+        titles.grid(row=0, column=0, sticky="w")
+        T(ctk.CTkLabel(titles, text=APP_NAME, font=self._font(26, "bold")), text_color="fg").pack(anchor="w")
+        T(
+            ctk.CTkLabel(titles, text="Cole um link, escolha os vídeos e baixe em MP4 ou MP3.", font=self._font(13)),
+            text_color="muted",
         ).pack(anchor="w")
+        tools = ctk.CTkFrame(head, fg_color="transparent")
+        tools.grid(row=0, column=1, sticky="e")
+        self.btn_about = T(
+            ctk.CTkButton(
+                tools, text="Sobre", width=70, height=32, font=self._font(13, underline=True),
+                fg_color="transparent", command=self.on_about,
+            ),
+            text_color="accent", hover_color="card2",
+        )
+        self.btn_about.pack(side="left", padx=(0, 6))
+        self.btn_theme = T(
+            ctk.CTkButton(
+                tools, text="Tema claro", width=110, height=32, font=self._font(13),
+                border_width=1, fg_color="transparent", command=self.on_toggle_theme,
+            ),
+            text_color="fg", border_color="border", hover_color="card2",
+        )
+        self.btn_theme.pack(side="left")
 
         # Cartão do link
-        card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        card = T(ctk.CTkFrame(self, corner_radius=14, border_width=1), fg_color="card", border_color="border")
         card.grid(row=1, column=0, sticky="ew", padx=pad, pady=(6, 10))
         card.grid_columnconfigure(0, weight=1)
         self.url_var = tk.StringVar()
-        self.entry = ctk.CTkEntry(
-            card,
-            textvariable=self.url_var,
-            height=44,
-            font=self._font(14),
-            placeholder_text="Cole aqui o link (vídeo, playlist, canal ou página com vídeos)…",
-            fg_color=CARD2,
-            border_color=BORDER,
-            text_color=FG,
+        self.entry = T(
+            ctk.CTkEntry(
+                card, textvariable=self.url_var, height=44, font=self._font(14),
+                placeholder_text="Cole aqui o link (vídeo, playlist, canal ou página com vídeos)…",
+            ),
+            fg_color="card2", border_color="border", text_color="fg", placeholder_text_color="muted",
         )
         self.entry.grid(row=0, column=0, sticky="ew", padx=(16, 8), pady=16)
         self.entry.bind("<Return>", lambda _e: self.on_analyze())
-        self.btn_paste = ctk.CTkButton(
-            card, text="Colar", width=90, height=44, font=self._font(14),
-            fg_color=CARD2, hover_color=BORDER, text_color=FG, command=self.on_paste,
+        self.btn_paste = T(
+            ctk.CTkButton(card, text="Colar", width=84, height=44, font=self._font(14), command=self.on_paste),
+            fg_color="card2", hover_color="border", text_color="fg",
         )
-        self.btn_paste.grid(row=0, column=1, padx=4, pady=16)
-        self.btn_analyze = ctk.CTkButton(
-            card, text="Verificar", width=130, height=44, font=self._font(14, "bold"),
-            fg_color=ACCENT, hover_color=ACCENT_H, command=self.on_analyze,
+        self.btn_paste.grid(row=0, column=1, padx=3, pady=16)
+        self.btn_clear = T(
+            ctk.CTkButton(card, text="Limpar", width=84, height=44, font=self._font(14), command=self.on_clear),
+            fg_color="card2", hover_color="border", text_color="fg",
         )
-        self.btn_analyze.grid(row=0, column=2, padx=(4, 16), pady=16)
+        self.btn_clear.grid(row=0, column=2, padx=3, pady=16)
+        self.btn_analyze = T(
+            ctk.CTkButton(
+                card, text="Verificar", width=130, height=44, font=self._font(14, "bold"), command=self.on_analyze
+            ),
+            fg_color="accent", hover_color="accent_h", text_color="#FFFFFF",
+        )
+        self.btn_analyze.grid(row=0, column=3, padx=(3, 16), pady=16)
 
         # Cartão da lista
-        lst = ctk.CTkFrame(self, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        lst = T(ctk.CTkFrame(self, corner_radius=14, border_width=1), fg_color="card", border_color="border")
         lst.grid(row=2, column=0, sticky="nsew", padx=pad, pady=(0, 10))
         lst.grid_columnconfigure(0, weight=1)
         lst.grid_rowconfigure(1, weight=1)
 
         bar = ctk.CTkFrame(lst, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
-        self.lbl_found = ctk.CTkLabel(bar, text="Vídeos encontrados", font=self._font(14, "bold"), text_color=FG)
+        self.lbl_found = T(
+            ctk.CTkLabel(bar, text="Vídeos encontrados", font=self._font(14, "bold")), text_color="fg"
+        )
         self.lbl_found.pack(side="left")
-        self.btn_none = ctk.CTkButton(
-            bar, text="Desmarcar", width=90, height=28, font=self._font(12),
-            fg_color="transparent", hover_color=CARD2, text_color=MUTED,
-            command=lambda: self._set_all(False),
+        self.btn_none = T(
+            ctk.CTkButton(
+                bar, text="Desmarcar", width=90, height=28, font=self._font(12),
+                fg_color="transparent", command=lambda: self._set_all(False),
+            ),
+            hover_color="card2", text_color="muted",
         )
         self.btn_none.pack(side="right")
-        self.btn_all = ctk.CTkButton(
-            bar, text="Marcar todos", width=100, height=28, font=self._font(12),
-            fg_color="transparent", hover_color=CARD2, text_color=MUTED,
-            command=lambda: self._set_all(True),
+        self.btn_all = T(
+            ctk.CTkButton(
+                bar, text="Marcar todos", width=100, height=28, font=self._font(12),
+                fg_color="transparent", command=lambda: self._set_all(True),
+            ),
+            hover_color="card2", text_color="muted",
         )
         self.btn_all.pack(side="right", padx=(0, 4))
-        self.lbl_sel = ctk.CTkLabel(bar, text="", font=self._font(12), text_color=MUTED)
+        self.lbl_sel = T(ctk.CTkLabel(bar, text="", font=self._font(12)), text_color="muted")
         self.lbl_sel.pack(side="right", padx=12)
 
-        wrap = ctk.CTkFrame(lst, fg_color=CARD2, corner_radius=8)
+        wrap = T(ctk.CTkFrame(lst, corner_radius=8), fg_color="card2")
         wrap.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_rowconfigure(0, weight=1)
-        self._style_tree()
         s = self._scale()
         self.tree = ttk.Treeview(
             wrap, style="Vid.Treeview", show="headings", selectmode="none",
@@ -213,109 +318,113 @@ class App(ctk.CTk):
         self.tree.column("dur", width=int(90 * s), anchor="center", stretch=False)
         self.tree.column("channel", width=int(180 * s), anchor="w", stretch=False)
         self.tree.column("status", width=int(180 * s), anchor="w", stretch=False)
-        self.tree.tag_configure("even", background=CARD2)
-        self.tree.tag_configure("odd", background=ROW_ALT)
-        self.tree.tag_configure("done", foreground=OK)
-        self.tree.tag_configure("error", foreground=ERR)
-        self.tree.tag_configure("active", foreground=ACCENT)
         self.tree.bind("<Button-1>", self._on_tree_click)
-        sb = ctk.CTkScrollbar(wrap, command=self.tree.yview, fg_color=CARD2, button_color=BORDER)
+        sb = T(ctk.CTkScrollbar(wrap, command=self.tree.yview), fg_color="card2", button_color="border",
+               button_hover_color="muted")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
         sb.grid(row=0, column=1, sticky="ns", padx=(0, 3), pady=4)
-        self.empty = ctk.CTkLabel(
-            wrap,
-            text="Cole um link acima e clique em Verificar\npara listar os vídeos disponíveis.",
-            font=self._font(14), text_color=MUTED, fg_color=CARD2, justify="center",
+        self.empty = T(
+            ctk.CTkLabel(
+                wrap,
+                text="Cole um link acima e clique em Verificar\npara listar os vídeos disponíveis.",
+                font=self._font(14), justify="center",
+            ),
+            text_color="muted", fg_color="card2",
         )
         self.empty.place(relx=0.5, rely=0.5, anchor="center")
 
         # Cartão de opções
-        opt = ctk.CTkFrame(self, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        opt = T(ctk.CTkFrame(self, corner_radius=14, border_width=1), fg_color="card", border_color="border")
         opt.grid(row=3, column=0, sticky="ew", padx=pad, pady=(0, 10))
         opt.grid_columnconfigure(5, weight=1)
-        lbl = dict(font=self._font(13), text_color=MUTED)
-        ctk.CTkLabel(opt, text="Formato", **lbl).grid(row=0, column=0, padx=(16, 8), pady=(14, 6), sticky="w")
-        self.seg_kind = ctk.CTkSegmentedButton(
-            opt, values=[LABEL_VIDEO, LABEL_AUDIO], command=self._apply_kind, height=36,
-            font=self._font(13), selected_color=ACCENT, selected_hover_color=ACCENT_H,
-            unselected_color=CARD2, unselected_hover_color=BORDER, fg_color=CARD2,
+        T(ctk.CTkLabel(opt, text="Formato", font=self._font(13)), text_color="muted").grid(
+            row=0, column=0, padx=(16, 8), pady=(14, 6), sticky="w")
+        self.seg_kind = T(
+            ctk.CTkSegmentedButton(
+                opt, values=[LABEL_VIDEO, LABEL_AUDIO], command=self._apply_kind, height=36, font=self._font(13),
+            ),
+            selected_color="accent", selected_hover_color="accent_h", unselected_color="card2",
+            unselected_hover_color="border", fg_color="card2", text_color="fg",
         )
         self.seg_kind.grid(row=0, column=1, pady=(14, 6), sticky="w")
-        ctk.CTkLabel(opt, text="Qualidade", **lbl).grid(row=0, column=2, padx=(24, 8), pady=(14, 6), sticky="w")
+        T(ctk.CTkLabel(opt, text="Qualidade", font=self._font(13)), text_color="muted").grid(
+            row=0, column=2, padx=(24, 8), pady=(14, 6), sticky="w")
         self.quality_var = tk.StringVar()
-        self.menu_quality = ctk.CTkOptionMenu(
-            opt, variable=self.quality_var, values=list(core.VIDEO_QUALITIES), width=170, height=36,
-            font=self._font(13), dropdown_font=self._font(13), fg_color=CARD2, button_color=BORDER,
-            button_hover_color=ACCENT, dropdown_fg_color=CARD2, dropdown_hover_color=BORDER, text_color=FG,
+        self.menu_quality = T(
+            ctk.CTkOptionMenu(
+                opt, variable=self.quality_var, values=list(core.VIDEO_QUALITIES), width=170, height=36,
+                font=self._font(13), dropdown_font=self._font(13),
+            ),
+            fg_color="card2", button_color="border", button_hover_color="accent", dropdown_fg_color="card2",
+            dropdown_hover_color="border", dropdown_text_color="fg", text_color="fg",
         )
         self.menu_quality.grid(row=0, column=3, pady=(14, 6), sticky="w")
 
-        ctk.CTkLabel(opt, text="Salvar em", **lbl).grid(row=1, column=0, padx=(16, 8), pady=(6, 14), sticky="w")
+        T(ctk.CTkLabel(opt, text="Salvar em", font=self._font(13)), text_color="muted").grid(
+            row=1, column=0, padx=(16, 8), pady=(6, 14), sticky="w")
         self.dest_var = tk.StringVar(value=str(self.dest))
-        ctk.CTkEntry(
-            opt, textvariable=self.dest_var, state="readonly", height=36, font=self._font(13),
-            fg_color=CARD2, border_color=BORDER, text_color=FG,
+        T(
+            ctk.CTkEntry(opt, textvariable=self.dest_var, state="readonly", height=36, font=self._font(13)),
+            fg_color="card2", border_color="border", text_color="fg",
         ).grid(row=1, column=1, columnspan=5, sticky="ew", pady=(6, 14), padx=(0, 8))
-        ctk.CTkButton(
-            opt, text="Alterar…", width=90, height=36, font=self._font(13), fg_color=CARD2,
-            hover_color=BORDER, text_color=FG, command=self.on_choose_dest,
+        T(
+            ctk.CTkButton(opt, text="Alterar…", width=90, height=36, font=self._font(13),
+                          command=self.on_choose_dest),
+            fg_color="card2", hover_color="border", text_color="fg",
         ).grid(row=1, column=6, pady=(6, 14), padx=4)
-        ctk.CTkButton(
-            opt, text="Abrir pasta", width=100, height=36, font=self._font(13), fg_color=CARD2,
-            hover_color=BORDER, text_color=FG, command=self.on_open_dest,
+        T(
+            ctk.CTkButton(opt, text="Abrir pasta", width=100, height=36, font=self._font(13),
+                          command=self.on_open_dest),
+            fg_color="card2", hover_color="border", text_color="fg",
         ).grid(row=1, column=7, pady=(6, 14), padx=(4, 16))
 
         # Rodapé
         foot = ctk.CTkFrame(self, fg_color="transparent")
         foot.grid(row=4, column=0, sticky="ew", padx=pad, pady=(0, 20))
         foot.grid_columnconfigure(0, weight=1)
-        self.progress = ctk.CTkProgressBar(foot, height=10, fg_color=CARD2, progress_color=ACCENT)
+        self.progress = T(ctk.CTkProgressBar(foot, height=10), fg_color="card2", progress_color="accent")
         self.progress.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         self.progress.set(0)
-        self.lbl_status = ctk.CTkLabel(
-            foot, text="Pronto.", anchor="w", justify="left", wraplength=620,
-            font=self._font(13), text_color=MUTED,
+        self.lbl_status = T(
+            ctk.CTkLabel(foot, text="Pronto.", anchor="w", justify="left", wraplength=620, font=self._font(13)),
+            text_color="muted",
         )
         self.lbl_status.grid(row=1, column=0, sticky="w")
         btns = ctk.CTkFrame(foot, fg_color="transparent")
         btns.grid(row=1, column=1, sticky="e")
-        self.btn_cancel = ctk.CTkButton(
-            btns, text="Cancelar", width=110, height=44, font=self._font(14), state="disabled",
-            fg_color="transparent", border_width=1, border_color=ERR, text_color=ERR,
-            hover_color=CARD2, command=self.on_cancel,
+        self.btn_cancel = T(
+            ctk.CTkButton(
+                btns, text="Cancelar", width=110, height=44, font=self._font(14), state="disabled",
+                fg_color="transparent", border_width=1, command=self.on_cancel,
+            ),
+            border_color="err", text_color="err", hover_color="card2",
         )
         self.btn_cancel.pack(side="left", padx=(0, 10))
-        self.btn_download = ctk.CTkButton(
-            btns, text="Baixar selecionados", width=210, height=44, font=self._font(15, "bold"),
-            fg_color=ACCENT, hover_color=ACCENT_H, command=self.on_download,
+        self.btn_download = T(
+            ctk.CTkButton(
+                btns, text="Baixar selecionados", width=210, height=44, font=self._font(15, "bold"),
+                command=self.on_download,
+            ),
+            fg_color="accent", hover_color="accent_h", text_color="#FFFFFF",
         )
         self.btn_download.pack(side="left")
 
-    def _style_tree(self) -> None:
-        s = self._scale()
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.layout("Vid.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        style.configure(
-            "Vid.Treeview", background=CARD2, fieldbackground=CARD2, foreground=FG,
-            borderwidth=0, rowheight=int(36 * s), font=("Segoe UI", 10),
-        )
-        style.configure(
-            "Vid.Treeview.Heading", background=CARD, foreground=MUTED, relief="flat",
-            borderwidth=0, padding=(8, 8), font=("Segoe UI", 10, "bold"),
-        )
-        style.map("Vid.Treeview.Heading", background=[("active", CARD)], foreground=[("active", FG)])
-
     # ------------------------------------------------------------- Estado --
-    def _status(self, text: str, color: str = MUTED) -> None:
-        self.lbl_status.configure(text=text, text_color=color)
+    def _status(self, text: str, color: str = "muted") -> None:
+        self.lbl_status.configure(text=text, text_color=self.P.get(color, color))
+        # a cor do status é pontual: sai do registro do tema para não ser repintada de volta
+        self._themed = [(w, o) for (w, o) in self._themed if w is not self.lbl_status]
+        if color == "muted":
+            self._themed.append((self.lbl_status, {"text_color": "muted"}))
+        else:
+            self._themed.append((self.lbl_status, {"text_color": color}))
 
     def _set_mode(self, mode: str | None) -> None:
         self.mode = mode
         idle = mode is None
         state = "normal" if idle else "disabled"
-        for w in (self.btn_analyze, self.btn_paste, self.btn_download, self.btn_all, self.btn_none):
+        for w in (self.btn_analyze, self.btn_paste, self.btn_clear, self.btn_download, self.btn_all, self.btn_none):
             w.configure(state=state)
         self.seg_kind.configure(state=state)
         self.menu_quality.configure(state=state)
@@ -370,7 +479,7 @@ class App(ctk.CTk):
         self.lbl_found.configure(text=head[:90])
         self._update_counter()
         if truncated:
-            self._status(f"Lista limitada aos primeiros {core.MAX_ENTRIES} vídeos.", MUTED)
+            self._status(f"Lista limitada aos primeiros {core.MAX_ENTRIES} vídeos.")
 
     def _update_counter(self) -> None:
         total = len(self.items)
@@ -417,12 +526,22 @@ class App(ctk.CTk):
             self.url_var.set(text)
             self.on_analyze()
 
+    def on_clear(self) -> None:
+        """Limpa o campo do link e a lista de vídeos."""
+        if self.mode is not None:
+            return
+        self.url_var.set("")
+        self._clear_list()
+        self.progress.set(0)
+        self._status("Pronto.")
+        self.entry.focus_set()
+
     def on_analyze(self) -> None:
         if self.mode is not None:
             return
         url = self.url_var.get().strip()
         if not url:
-            self._status("Cole um link primeiro.", ERR)
+            self._status("Cole um link primeiro.", "err")
             return
         if not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
             url = "https://" + url
@@ -460,7 +579,7 @@ class App(ctk.CTk):
             return
         jobs = [(iid, self.items[iid]) for iid in self.tree.get_children() if iid in self.checked]
         if not jobs:
-            self._status("Marque pelo menos um vídeo para baixar.", ERR)
+            self._status("Marque pelo menos um vídeo para baixar.", "err")
             return
         try:
             self.dest.mkdir(parents=True, exist_ok=True)
@@ -509,7 +628,74 @@ class App(ctk.CTk):
                 self.msgs.put(("row", iid, "✖ Erro", "error"))
         self.msgs.put(("finished", ok, err, self.cancel.is_set(), last_error))
 
-    # --------------------------------------------------------- Mensagens ---
+    # ------------------------------------------------------------- Sobre ----
+    def on_about(self) -> None:
+        P = self.P
+        s = self._scale()
+        w, h = 480, 650
+        dlg = ctk.CTkToplevel(self, fg_color=P["card"])
+        dlg.title("Sobre")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - int(w * s)) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - int(h * s)) // 2)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        self._set_icon(dlg)
+
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=28, pady=(24, 18))
+        body.grid_columnconfigure(0, weight=1)
+
+        def separator(row: int) -> None:
+            ctk.CTkFrame(body, height=1, fg_color=P["border"]).grid(row=row, column=0, sticky="ew", pady=14)
+
+        def info_rows(row: int, rows: list[tuple[str, str]]) -> None:
+            box = ctk.CTkFrame(body, fg_color="transparent")
+            box.grid(row=row, column=0, sticky="ew")
+            box.grid_columnconfigure(1, weight=1)
+            for i, (label, value) in enumerate(rows):
+                ctk.CTkLabel(box, text=label, font=self._font(14), text_color=P["muted"], anchor="w").grid(
+                    row=i, column=0, sticky="w", pady=5, padx=(0, 20))
+                ctk.CTkLabel(box, text=value, font=self._font(14), text_color=P["fg"], anchor="w").grid(
+                    row=i, column=1, sticky="w", pady=5)
+
+        ctk.CTkLabel(body, text="Sobre", font=self._font(24), text_color=P["fg"], anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, 14))
+        ctk.CTkLabel(body, text=APP_NAME, font=self._font(22), text_color=P["accent"], anchor="w").grid(
+            row=1, column=0, sticky="w")
+        ctk.CTkLabel(
+            body, text=APP_DESC, font=self._font(14), text_color=P["muted"], anchor="w", justify="left",
+            wraplength=420,
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        separator(3)
+        info_rows(4, [("Versão", APP_VERSION), ("Última atualização", APP_UPDATED), ("Compatibilidade", APP_COMPAT)])
+        separator(5)
+        info_rows(6, [("Desenvolvido por", APP_AUTHOR), ("Contato", APP_EMAIL)])
+        ctk.CTkButton(
+            body, text="Enviar e-mail", height=42, font=self._font(14, "bold"), fg_color="transparent",
+            border_width=1, border_color=P["border"], text_color=P["accent"], hover_color=P["card2"],
+            corner_radius=21, command=self._send_email,
+        ).grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        separator(8)
+        ctk.CTkLabel(body, text="Proteção de dados", font=self._font(15, "bold"), text_color=P["fg"],
+                     anchor="w").grid(row=9, column=0, sticky="w")
+        ctk.CTkLabel(
+            body, text=APP_PRIVACY, font=self._font(13), text_color=P["muted"], anchor="w", justify="left",
+            wraplength=420,
+        ).grid(row=10, column=0, sticky="w", pady=(8, 0))
+        body.grid_rowconfigure(11, weight=1)
+        ctk.CTkButton(
+            body, text="Fechar", width=90, height=36, font=self._font(14, "bold"), fg_color="transparent",
+            text_color=P["accent"], hover_color=P["card2"], command=dlg.destroy,
+        ).grid(row=12, column=0, sticky="e", pady=(10, 0))
+
+        dlg.after(150, lambda: (dlg.grab_set(), dlg.focus_force()))
+
+    @staticmethod
+    def _send_email() -> None:
+        webbrowser.open(f"mailto:{APP_EMAIL}?subject={quote(APP_NAME + ' - contato')}")
+
+    # ---------------------------------------------------------- Mensagens ---
     def _poll(self) -> None:
         try:
             while True:
@@ -517,6 +703,28 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
         self.after(80, self._poll)
+
+    def _in_background(self) -> bool:
+        try:
+            return self.state() == "iconic" or self.focus_displayof() is None
+        except Exception:
+            return False
+
+    def _notify_done(self, ok: int, err: int) -> None:
+        """Avisa o usuário (janela em segundo plano) que os downloads terminaram."""
+        if not self._in_background():
+            return
+        if err:
+            body = f"{ok} concluído(s), {err} com erro."
+        else:
+            body = f"{ok} arquivo(s) salvo(s) em {self.dest}"
+        notify.toast("Downloads finalizados", body)
+        notify.beep()
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()  # type: ignore[attr-defined]
+            notify.flash_taskbar(hwnd)
+        except Exception:
+            pass
 
     def _handle(self, msg: tuple) -> None:
         kind = msg[0]
@@ -528,10 +736,10 @@ class App(ctk.CTk):
                 if not truncated:
                     self._status("Pronto. Marque os vídeos, escolha o formato e clique em Baixar.")
             else:
-                self._status("Nenhum vídeo encontrado nesse link.", ERR)
+                self._status("Nenhum vídeo encontrado nesse link.", "err")
         elif kind == "analyze_error":
             self._set_mode(None)
-            self._status(msg[1], ERR)
+            self._status(msg[1], "err")
         elif kind == "row":
             _, iid, text, tag = msg
             self.tree.set(iid, "status", text)
@@ -546,12 +754,14 @@ class App(ctk.CTk):
             _, ok, err, cancelled, last_error = msg
             self._set_mode(None)
             if cancelled:
-                self._status(f"Cancelado. {ok} concluído(s).", MUTED)
-            elif err == 0:
+                self._status(f"Cancelado. {ok} concluído(s).")
+                return
+            if err == 0:
                 self.progress.set(1)
-                self._status(f"Tudo certo! {ok} arquivo(s) salvo(s) em {self.dest}", OK)
+                self._status(f"Tudo certo! {ok} arquivo(s) salvo(s) em {self.dest}", "ok")
             else:
-                self._status(f"{ok} concluído(s), {err} com erro — {last_error}", ERR)
+                self._status(f"{ok} concluído(s), {err} com erro — {last_error}", "err")
+            self._notify_done(ok, err)
 
     def _on_close(self) -> None:
         if self.mode == "download" and not messagebox.askyesno(
@@ -559,12 +769,14 @@ class App(ctk.CTk):
         ):
             return
         self.cancel.set()
-        save_config({"dest": str(self.dest), "kind": self.kind_label, "quality": self.quality_var.get()})
+        save_config({
+            "dest": str(self.dest), "kind": self.kind_label,
+            "quality": self.quality_var.get(), "theme": self.theme,
+        })
         self.destroy()
 
 
 def main() -> None:
-    ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     App().mainloop()
 
