@@ -72,6 +72,7 @@ class VideoItem:
     title: str
     duration: Optional[int] = None
     channel: str = ""
+    thumbnail: str = ""
 
 
 class _QuietLogger:
@@ -147,6 +148,47 @@ def _base_opts() -> dict:
 # --------------------------------------------------------------------------- #
 # Análise do link
 # --------------------------------------------------------------------------- #
+def _pick_thumbnail(info: dict) -> str:
+    """Escolhe uma miniatura pequena (>= 160 px de largura, se houver)."""
+    thumbs = [t for t in (info.get("thumbnails") or []) if t.get("url")]
+    good = [t for t in thumbs if (t.get("width") or 0) >= 160]
+    if good:
+        return str(min(good, key=lambda t: t["width"])["url"])
+    if info.get("thumbnail"):
+        return str(info["thumbnail"])
+    if thumbs:
+        return str(thumbs[-1]["url"])
+    kind = str(info.get("ie_key") or info.get("extractor_key") or "").lower()
+    if "youtube" in kind and info.get("id"):
+        return f"https://i.ytimg.com/vi/{info['id']}/mqdefault.jpg"
+    return ""
+
+
+def fetch_thumbnail(url: str, size: tuple):
+    """Baixa a miniatura e devolve uma imagem PIL recortada em `size` (ou None se falhar)."""
+    try:
+        import io
+        import ssl
+        import urllib.request
+
+        from PIL import Image, ImageOps
+
+        ctx = None
+        try:
+            import certifi
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+            data = resp.read(3_000_000)
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        return ImageOps.fit(img, size, Image.Resampling.LANCZOS)
+    except Exception:
+        return None
+
+
 def _collect(info: Optional[dict], out: list, seen: set) -> None:
     if not info or len(out) >= MAX_ENTRIES:
         return
@@ -174,6 +216,7 @@ def _collect(info: Optional[dict], out: list, seen: set) -> None:
             title=str(info.get("title") or url),
             duration=int(duration) if duration else None,
             channel=str(info.get("channel") or info.get("uploader") or ""),
+            thumbnail=_pick_thumbnail(info),
         )
     )
 

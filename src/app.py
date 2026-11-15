@@ -29,11 +29,13 @@ import re
 import threading
 import tkinter as tk
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote
 
 import customtkinter as ctk
+from PIL import ImageTk
 
 import core
 import notify
@@ -111,6 +113,9 @@ class App(ctk.CTk):
         self.cancel = threading.Event()
         self.items: dict[str, core.VideoItem] = {}
         self.checked: set[str] = set()
+        self.gen = 0  # "geração" da lista: descarta miniaturas de listas antigas
+        self.thumbs: dict[str, ImageTk.PhotoImage] = {}
+        self.pool = ThreadPoolExecutor(max_workers=6)
         self.mode: str | None = None  # None | "analyze" | "download"
         self.dest = Path(self.cfg.get("dest") or default_dest())
         self.kind_label = self.cfg.get("kind", LABEL_VIDEO)
@@ -157,7 +162,7 @@ class App(ctk.CTk):
         style.layout("Vid.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         style.configure(
             "Vid.Treeview", background=P["card2"], fieldbackground=P["card2"], foreground=P["fg"],
-            borderwidth=0, rowheight=int(36 * s), font=("Segoe UI", 10),
+            borderwidth=0, rowheight=int(54 * s), font=("Segoe UI", 10),
         )
         style.configure(
             "Vid.Treeview.Heading", background=P["card"], foreground=P["muted"], relief="flat",
@@ -305,9 +310,12 @@ class App(ctk.CTk):
         wrap.grid_rowconfigure(0, weight=1)
         s = self._scale()
         self.tree = ttk.Treeview(
-            wrap, style="Vid.Treeview", show="headings", selectmode="none",
+            wrap, style="Vid.Treeview", show="tree headings", selectmode="none",
             columns=("sel", "title", "dur", "channel", "status"),
         )
+        self.thumb_size = (int(80 * s), int(45 * s))
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=int(96 * s), anchor="center", stretch=False)
         self.tree.heading("sel", text=CHECK_ON, command=self._toggle_all)
         self.tree.heading("title", text="Título", anchor="w")
         self.tree.heading("dur", text="Duração")
@@ -456,6 +464,8 @@ class App(ctk.CTk):
         self.tree.delete(*self.tree.get_children())
         self.items.clear()
         self.checked.clear()
+        self.thumbs.clear()
+        self.gen += 1
         self.lbl_found.configure(text="Vídeos encontrados")
         self.lbl_sel.configure(text="")
         self.tree.heading("sel", text=CHECK_ON)
@@ -473,6 +483,9 @@ class App(ctk.CTk):
             )
         if items:
             self.empty.place_forget()
+        for iid, it in self.items.items():
+            if it.thumbnail:
+                self.pool.submit(self._thumb_worker, self.gen, iid, it.thumbnail)
         head = f"{len(items)} vídeo(s) encontrado(s)"
         if title:
             head += f" · {title}"
@@ -480,6 +493,13 @@ class App(ctk.CTk):
         self._update_counter()
         if truncated:
             self._status(f"Lista limitada aos primeiros {core.MAX_ENTRIES} vídeos.")
+
+    def _thumb_worker(self, gen: int, iid: str, url: str) -> None:
+        if gen != self.gen:
+            return
+        img = core.fetch_thumbnail(url, self.thumb_size)
+        if img is not None:
+            self.msgs.put(("thumb", gen, iid, img))
 
     def _update_counter(self) -> None:
         total = len(self.items)
@@ -509,7 +529,7 @@ class App(ctk.CTk):
         self._set_all(len(self.checked) != len(self.items))
 
     def _on_tree_click(self, event) -> None:
-        if self.mode is not None or self.tree.identify_region(event.x, event.y) != "cell":
+        if self.mode is not None or self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
             return
         iid = self.tree.identify_row(event.y)
         if iid:
@@ -740,6 +760,12 @@ class App(ctk.CTk):
         elif kind == "analyze_error":
             self._set_mode(None)
             self._status(msg[1], "err")
+        elif kind == "thumb":
+            _, gen, iid, img = msg
+            if gen == self.gen and iid in self.items:
+                photo = ImageTk.PhotoImage(img)
+                self.thumbs[iid] = photo  # guarda a referência, senão o Tk apaga a imagem
+                self.tree.item(iid, image=photo)
         elif kind == "row":
             _, iid, text, tag = msg
             self.tree.set(iid, "status", text)
@@ -769,6 +795,7 @@ class App(ctk.CTk):
         ):
             return
         self.cancel.set()
+        self.pool.shutdown(wait=False, cancel_futures=True)
         save_config({
             "dest": str(self.dest), "kind": self.kind_label,
             "quality": self.quality_var.get(), "theme": self.theme,

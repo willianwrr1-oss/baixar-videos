@@ -17,6 +17,7 @@ inclusive playlists e canais.
 Os arquivos vão para a pasta Downloads (ou a que você escolher). O app lembra a última escolha,
 inclusive o tema (botão **Tema claro/escuro** no topo).
 
+- A lista mostra a miniatura de cada vídeo.
 - **Limpar** apaga o link e a lista de vídeos.
 - **Sobre** mostra versão, contato e proteção de dados.
 - Se a janela estiver em segundo plano quando os downloads terminarem, o Windows mostra uma notificação,
